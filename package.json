@@ -10,7 +10,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --write src tests *.json *.ts *.html *.md",
-    "test": "vitest run --exclude tests/firestore/**",
+    "test": "vitest run --exclude \"tests/firestore/**\"",
     "test:watch": "vitest",
     "test:rules": "firebase emulators:exec --project demo-split-budget --only firestore \"vitest run tests/firestore\"",
     "emulators": "firebase emulators:start --project demo-split-budget --only auth,firestore,hosting"
