@@ -4,7 +4,7 @@ import { getApps, initializeApp, type FirebaseApp } from "firebase/app";
 import { getAnalytics, isSupported as isAnalyticsSupported, type Analytics } from "firebase/analytics";
 
 const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY ?? "AIzaSyAO-7vRM4cG4BJ1g92CJjZw1O-FkECSNEY",
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
   authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN ?? "split-budget-69c92.firebaseapp.com",
   projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID ?? "split-budget-69c92",
   storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET ?? "split-budget-69c92.firebasestorage.app",

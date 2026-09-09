@@ -42,8 +42,8 @@ Historical spreadsheet migration is separate from deferred bank/CSV imports. Pre
 
 ## Deploy
 
-The default production branch is `main`; change both workflows if the repository uses another branch. The `Checks` workflow validates pull requests. Production deployment is disabled until GitHub variable `FIREBASE_DEPLOY_ENABLED` is set to `true`.
+The production branch is `master`. The `Checks` workflow validates pull requests, and the production workflow builds the Vite app before deploying Hosting, Firestore rules, and Firestore indexes.
 
-Create a GitHub `production` environment. Set variables `FIREBASE_PROJECT_ID`, `VITE_FIREBASE_AUTH_DOMAIN`, `VITE_FIREBASE_APP_ID`, and `VITE_HOUSEHOLD_ID`. Set secrets `VITE_FIREBASE_API_KEY` and `FIREBASE_SERVICE_ACCOUNT` (a Firebase deployment service account JSON credential). Grant only the roles needed for Hosting and Firestore rules/index deployment. Enable Google auth, provision the household/config/members, then enable automatic deployment. Use a single production Firebase project; local tests use emulators.
+Create a GitHub `production` environment. Set variables `FIREBASE_PROJECT_ID`, `VITE_FIREBASE_AUTH_DOMAIN`, `VITE_FIREBASE_APP_ID`, and `VITE_HOUSEHOLD_ID`; the storage, messaging sender, and measurement ID variables are optional because the client has project defaults. Set secrets `VITE_FIREBASE_API_KEY` and `FIREBASE_SERVICE_ACCOUNT_SPLIT_BUDGET_69C92` (a Firebase deployment service account JSON credential). Grant only the roles needed for Hosting and Firestore rules/index deployment. Enable Google auth, provision the household/config/members, then push to `master`. Use a single production Firebase project; local tests use emulators.
 
 There is no server runtime, bank integration, offline mutation queue, joint-account balance tracker or settlement-payment tracker. The PWA requires connectivity for real data entry. Before production launch, complete the unchecked external acceptance gates in the master checklist.
