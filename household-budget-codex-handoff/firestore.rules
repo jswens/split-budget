@@ -1,0 +1,142 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function memberDoc(householdId) {
+      return get(/databases/$(database)/documents/households/$(householdId)/members/$(request.auth.uid));
+    }
+
+    // Recommended implementation choice:
+    // Use auth UID as the member document ID for authorization lookup.
+    // Domain member IDs used in allocations may still be separate stable IDs
+    // if desired, but a uid -> member mapping must remain cheap and deterministic.
+    function isHouseholdMember(householdId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/households/$(householdId)/members/$(request.auth.uid))
+        && memberDoc(householdId).data.active == true;
+    }
+
+    function isOwner(householdId) {
+      return isHouseholdMember(householdId)
+        && memberDoc(householdId).data.role == "owner";
+    }
+
+    function validMoney(value) {
+      return value is int;
+    }
+
+    function validBasisPoints(value) {
+      return value is int && value >= 0 && value <= 10000;
+    }
+
+    match /households/{householdId} {
+      allow read: if isHouseholdMember(householdId);
+      allow create: if signedIn();
+      allow update: if isOwner(householdId);
+      allow delete: if false;
+
+      match /members/{memberId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create, update: if isOwner(householdId);
+        allow delete: if false;
+      }
+
+      match /accounts/{accountId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create, update: if isHouseholdMember(householdId);
+        allow delete: if false;
+      }
+
+      match /categories/{categoryId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create, update: if isHouseholdMember(householdId);
+        allow delete: if false;
+      }
+
+      match /projects/{projectId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create, update: if isHouseholdMember(householdId);
+        allow delete: if false;
+      }
+
+      match /settlementPools/{poolId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create, update: if isOwner(householdId);
+        allow delete: if false;
+      }
+
+      match /config/{configId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create, update: if isOwner(householdId);
+        allow delete: if false;
+      }
+
+      match /configHistory/{versionId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create: if isOwner(householdId);
+        allow update, delete: if false;
+      }
+
+      match /transactions/{transactionId} {
+        allow read: if isHouseholdMember(householdId);
+
+        allow create: if isHouseholdMember(householdId)
+          && request.resource.data.description is string
+          && validMoney(request.resource.data.amountCents)
+          && request.resource.data.settlementPoolId is string
+          && request.resource.data.status in ["draft", "posted", "excluded"];
+
+        // Detailed cross-document accounting validation lives in the domain layer.
+        // Production code should additionally prevent writes to transactions
+        // referenced by a finalized period unless the period is reopened.
+        allow update: if isHouseholdMember(householdId)
+          && validMoney(request.resource.data.amountCents);
+
+        allow delete: if false;
+      }
+
+      match /settlementPeriods/{periodId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create, update: if isHouseholdMember(householdId);
+        allow delete: if false;
+      }
+
+      match /settlements/{settlementId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create: if isHouseholdMember(householdId);
+        allow update, delete: if false;
+      }
+
+      match /recurringTemplates/{templateId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create, update: if isHouseholdMember(householdId);
+        allow delete: if false;
+      }
+
+      match /imports/{importId} {
+        allow read, create, update: if isHouseholdMember(householdId);
+        allow delete: if false;
+      }
+
+      match /importRecords/{recordId} {
+        allow read, create, update: if isHouseholdMember(householdId);
+        allow delete: if false;
+      }
+
+      match /auditLog/{eventId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create: if isHouseholdMember(householdId);
+        allow update, delete: if false;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

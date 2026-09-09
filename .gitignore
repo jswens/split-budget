@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.firebase/
+*-debug.log
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+coverage/
+private-data/
+emulator-data/
+service-account*.json
+*-backup-*.json
+.runtime/

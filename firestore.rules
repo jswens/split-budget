@@ -1,0 +1,63 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    // Membership is provisioned out of band and keyed by the auth UID.
+    function memberDoc(householdId) { return get(/databases/$(database)/documents/households/$(householdId)/members/$(request.auth.uid)); }
+    function isHouseholdMember(householdId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/households/$(householdId)/members/$(request.auth.uid))
+        && memberDoc(householdId).data.authUid == request.auth.uid
+        && memberDoc(householdId).data.active == true;
+    }
+    function validMoney(value) { return value is int && value >= 0; }
+    function periodEditable(householdId, periodId) {
+      return !exists(/databases/$(database)/documents/households/$(householdId)/settlementPeriods/$(periodId))
+        || get(/databases/$(database)/documents/households/$(householdId)/settlementPeriods/$(periodId)).data.status != "finalized";
+    }
+
+    match /households/{householdId} {
+      // Household and allowlist provisioning is trusted Admin SDK/console work.
+      allow read: if isHouseholdMember(householdId);
+      allow create, update, delete: if false;
+      match /members/{memberId} {
+        allow read: if isHouseholdMember(householdId);
+        allow create, update, delete: if false;
+      }
+      // Active members intentionally have equal permissions for ordinary data.
+      match /accounts/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
+      match /categories/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
+      match /projects/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
+      match /settlementPools/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
+      match /config/{id} { allow read, create, update: if isHouseholdMember(householdId) && id == "current"; allow delete: if false; }
+      match /configHistory/{id} { allow read: if isHouseholdMember(householdId); allow create: if isHouseholdMember(householdId); allow update, delete: if false; }
+      match /transactions/{id} {
+        allow read: if isHouseholdMember(householdId);
+        allow create: if isHouseholdMember(householdId) && request.resource.data.description is string && validMoney(request.resource.data.amountCents) && request.resource.data.settlementPoolId is string && request.resource.data.status in ["draft", "posted", "excluded"] && (!request.resource.data.keys().hasAny(["settlementPeriodId"]) || periodEditable(householdId, request.resource.data.settlementPeriodId));
+        // A finalized period must be reopened before its transactions can change.
+        allow update: if isHouseholdMember(householdId) && validMoney(request.resource.data.amountCents)
+          && (!resource.data.keys().hasAny(["settlementPeriodId"]) || periodEditable(householdId, resource.data.settlementPeriodId))
+          && (!request.resource.data.keys().hasAny(["settlementPeriodId"]) || periodEditable(householdId, request.resource.data.settlementPeriodId));
+        allow delete: if false;
+      }
+      match /settlementPeriods/{id} {
+        allow read: if isHouseholdMember(householdId);
+        allow create: if isHouseholdMember(householdId);
+        // An open/reviewed period may be finalized only with a snapshot ID;
+        // a finalized period can only transition back to open for reopening.
+        allow update: if isHouseholdMember(householdId)
+          && ((resource.data.status != "finalized" && request.resource.data.status != "finalized")
+            || (resource.data.status != "finalized" && request.resource.data.status == "finalized" && request.resource.data.finalizedSettlementId is string)
+            || (resource.data.status == "finalized" && request.resource.data.status == "open"));
+        allow delete: if false;
+      }
+      match /settlements/{id} { allow read: if isHouseholdMember(householdId); allow create: if isHouseholdMember(householdId); allow update, delete: if false; }
+      match /recurringTemplates/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
+      match /imports/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
+      match /importRecords/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
+      match /auditLog/{id} { allow read, create: if isHouseholdMember(householdId); allow update, delete: if false; }
+    }
+    match /{document=**} { allow read, write: if false; }
+  }
+}
