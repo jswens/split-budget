@@ -39,4 +39,8 @@ jobs:
       - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_SPLIT_BUDGET_69C92 }}
+      - name: Verify Firebase deploy identity
+        run: |
+          echo "credential project: $(jq -r '.project_id' \"$GOOGLE_GHA_CREDS_PATH\")"
+          echo "credential account: $(jq -r '.client_email' \"$GOOGLE_GHA_CREDS_PATH\")"
       - run: npx firebase deploy --project "$VITE_FIREBASE_PROJECT_ID" --only hosting,firestore:rules,firestore:indexes --non-interactive
