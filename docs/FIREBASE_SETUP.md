@@ -4,21 +4,31 @@ The client uses Google Sign-In and Cloud Firestore. Production credentials belon
 
 Enable Google as an Authentication provider in the Firebase console. Add the local development host and the production Hosting domain to Authentication's authorized domains.
 
-## Secure household provisioning
+## Household onboarding and access
 
-Membership is an allowlist. A membership document is created by a trusted provisioning path (Firebase console, Admin SDK, or a controlled migration script) at:
+Membership is still an allowlist, but normal onboarding now happens in the app. After Google sign-in, a user can create a household or request access to an existing one.
+
+When creating a household, the client atomically creates the root, the owner's membership, and starter configuration. The Firestore rules only permit this as a tightly constrained first write by the signed-in user; they do not permit arbitrary household creation or membership edits.
+
+To join an existing household, share its code from Settings:
+
+```text
+Settings → Share this household code
+```
+
+The joining user submits the code and remains pending. Existing active members see an access-request alert and can approve or decline it. Approval atomically changes the request and creates the UID-keyed member document. A household code is an identifier, not a password; approval is still required.
+
+For legacy households, the member document remains:
 
 ```text
 households/{householdId}/members/{authUid}
 ```
 
-The document must include the member's auth UID, display name, role (`owner` or `member`), `active: true`, and ISO-equivalent Firestore timestamps. The document ID must equal the Google auth UID. The client cannot create or update membership documents and cannot create a household, so signing in never grants access by itself. All active members have equal read/write access to ordinary household data; owner/member is retained for controlled provisioning and future administration.
-
-Create the household document and initial member documents before opening the app. To add a user, first obtain the user's Firebase Auth UID after their first Google sign-in, then provision the UID document out of band. Set `active` to false to revoke access without deleting historical references.
+It must contain the auth UID, display name, role (`owner` or `member`), `active: true`, and Firestore timestamps. The document ID must equal the Google auth UID. Existing provisioned households can continue using `VITE_HOUSEHOLD_ID`; new users will be routed into onboarding when they do not yet have access.
 
 ## Local emulators
 
-Run `firebase emulators:start` after installing `firebase-tools`, set `VITE_USE_FIREBASE_EMULATORS=true`, and use the demo project ID above (or set `VITE_FIREBASE_PROJECT_ID`). Emulator rules tests should seed memberships directly through the Admin SDK/rules test utilities; a client must never be able to self-enroll.
+Run `firebase emulators:start` after installing `firebase-tools`, set `VITE_USE_FIREBASE_EMULATORS=true`, and use the demo project ID above (or set `VITE_FIREBASE_PROJECT_ID`). The rules tests use trusted fixtures for existing households; production onboarding is exercised through the constrained create/request/approval rules described above.
 
 There is intentionally no production deployment step in this repository setup guide.
 

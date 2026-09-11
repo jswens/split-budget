@@ -3,7 +3,9 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() { return request.auth != null; }
-    // Membership is provisioned out of band and keyed by the auth UID.
+    function rootPath(householdId) { return /databases/$(database)/documents/households/$(householdId); }
+    function memberPath(householdId, uid) { return /databases/$(database)/documents/households/$(householdId)/members/$(uid); }
+    function joinRequestPath(householdId, uid) { return /databases/$(database)/documents/households/$(householdId)/joinRequests/$(uid); }
     function memberDoc(householdId) { return get(/databases/$(database)/documents/households/$(householdId)/members/$(request.auth.uid)); }
     function isHouseholdMember(householdId) {
       return signedIn()
@@ -11,31 +13,120 @@ service cloud.firestore {
         && memberDoc(householdId).data.authUid == request.auth.uid
         && memberDoc(householdId).data.active == true;
     }
+    function validHousehold(data) {
+      return data.keys().hasOnly(["name", "currency", "timezone", "schemaVersion", "createdAt", "updatedAt"])
+        && data.name is string && data.name.size() > 0 && data.name.size() <= 80
+        && data.currency == "USD"
+        && data.timezone is string && data.timezone.size() > 0 && data.timezone.size() <= 80
+        && data.schemaVersion is int && data.schemaVersion == 1
+        && data.createdAt is timestamp && data.updatedAt is timestamp;
+    }
+    function validMember(data) {
+      return data.keys().hasOnly(["authUid", "displayName", "role", "active", "createdAt", "updatedAt"])
+        && data.authUid is string && data.authUid.size() > 0 && data.authUid.size() <= 128
+        && data.displayName is string && data.displayName.size() > 0 && data.displayName.size() <= 120
+        && data.role in ["owner", "member"]
+        && data.active is bool
+        && data.createdAt is timestamp && data.updatedAt is timestamp;
+    }
+    function validJoinRequest(data) {
+      return data.keys().hasOnly(["requesterUid", "displayName", "email", "status", "createdAt", "updatedAt", "reviewedByUid"])
+        && data.requesterUid is string && data.requesterUid.size() > 0 && data.requesterUid.size() <= 128
+        && data.displayName is string && data.displayName.size() > 0 && data.displayName.size() <= 120
+        && (!data.keys().hasAny(["email"]) || (data.email is string && data.email.size() <= 320))
+        && data.status in ["pending", "approved", "rejected"]
+        && data.createdAt is timestamp && data.updatedAt is timestamp
+        && (!data.keys().hasAny(["reviewedByUid"]) || (data.reviewedByUid is string && data.reviewedByUid.size() <= 128));
+    }
     function validMoney(value) { return value is int && value >= 0; }
     function periodEditable(householdId, periodId) {
       return !exists(/databases/$(database)/documents/households/$(householdId)/settlementPeriods/$(periodId))
         || get(/databases/$(database)/documents/households/$(householdId)/settlementPeriods/$(periodId)).data.status != "finalized";
     }
+    // The creator writes the root, owner membership, and starter data atomically.
+    function isInitialHouseholdSetup(householdId) {
+      return signedIn()
+        && !exists(rootPath(householdId))
+        && getAfter(rootPath(householdId)) != null
+        && getAfter(memberPath(householdId, request.auth.uid)) != null
+        && getAfter(memberPath(householdId, request.auth.uid)).data.authUid == request.auth.uid
+        && getAfter(memberPath(householdId, request.auth.uid)).data.role == "owner"
+        && getAfter(memberPath(householdId, request.auth.uid)).data.active == true;
+    }
+    function canCreateHouseholdData(householdId) {
+      return isHouseholdMember(householdId) || isInitialHouseholdSetup(householdId);
+    }
 
     match /households/{householdId} {
-      // Household and allowlist provisioning is trusted Admin SDK/console work.
       allow read: if isHouseholdMember(householdId);
-      allow create, update, delete: if false;
+      allow create: if signedIn()
+        && validHousehold(request.resource.data)
+        && getAfter(memberPath(householdId, request.auth.uid)) != null
+        && getAfter(memberPath(householdId, request.auth.uid)).data.authUid == request.auth.uid
+        && getAfter(memberPath(householdId, request.auth.uid)).data.role == "owner"
+        && getAfter(memberPath(householdId, request.auth.uid)).data.active == true;
+      allow update, delete: if false;
+
       match /members/{memberId} {
         allow read: if isHouseholdMember(householdId);
-        allow create, update, delete: if false;
+        allow create: if validMember(request.resource.data) && (
+          (signedIn()
+            && !exists(rootPath(householdId))
+            && memberId == request.auth.uid
+            && request.resource.data.authUid == request.auth.uid
+            && request.resource.data.role == "owner"
+            && request.resource.data.active == true
+            && getAfter(rootPath(householdId)) != null
+            && validHousehold(getAfter(rootPath(householdId)).data))
+          || (isHouseholdMember(householdId)
+            && memberId == request.resource.data.authUid
+            && request.resource.data.role == "member"
+            && request.resource.data.active == true
+            && getAfter(joinRequestPath(householdId, memberId)) != null
+            && getAfter(joinRequestPath(householdId, memberId)).data.requesterUid == memberId
+            && getAfter(joinRequestPath(householdId, memberId)).data.status == "approved")
+        );
+        allow update, delete: if false;
       }
-      // Active members intentionally have equal permissions for ordinary data.
-      match /accounts/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
-      match /categories/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
-      match /projects/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
-      match /settlementPools/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
-      match /config/{id} { allow read, create, update: if isHouseholdMember(householdId) && id == "current"; allow delete: if false; }
-      match /configHistory/{id} { allow read: if isHouseholdMember(householdId); allow create: if isHouseholdMember(householdId); allow update, delete: if false; }
+
+      match /joinRequests/{requestId} {
+        allow create: if signedIn()
+          && exists(rootPath(householdId))
+          && !isHouseholdMember(householdId)
+          && requestId == request.auth.uid
+          && validJoinRequest(request.resource.data)
+          && request.resource.data.requesterUid == request.auth.uid
+          && request.resource.data.status == "pending";
+        allow read: if isHouseholdMember(householdId)
+          || (signedIn() && requestId == request.auth.uid && resource.data.requesterUid == request.auth.uid);
+        allow update: if (
+            isHouseholdMember(householdId)
+            && validJoinRequest(request.resource.data)
+            && resource.data.requesterUid == request.resource.data.requesterUid
+            && resource.data.status == "pending"
+            && request.resource.data.status in ["approved", "rejected"]
+            && request.resource.data.reviewedByUid == request.auth.uid
+          ) || (
+            signedIn()
+            && requestId == request.auth.uid
+            && resource.data.requesterUid == request.auth.uid
+            && resource.data.status == "rejected"
+            && validJoinRequest(request.resource.data)
+            && request.resource.data.status == "pending"
+            && !request.resource.data.keys().hasAny(["reviewedByUid"])
+          );
+        allow delete: if false;
+      }
+
+      match /accounts/{id} { allow read, update: if isHouseholdMember(householdId); allow create: if canCreateHouseholdData(householdId); allow delete: if false; }
+      match /categories/{id} { allow read, update: if isHouseholdMember(householdId); allow create: if canCreateHouseholdData(householdId); allow delete: if false; }
+      match /projects/{id} { allow read, update: if isHouseholdMember(householdId); allow create: if canCreateHouseholdData(householdId); allow delete: if false; }
+      match /settlementPools/{id} { allow read, update: if isHouseholdMember(householdId); allow create: if canCreateHouseholdData(householdId); allow delete: if false; }
+      match /config/{id} { allow read, update: if isHouseholdMember(householdId) && id == "current"; allow create: if canCreateHouseholdData(householdId) && id == "current"; allow delete: if false; }
+      match /configHistory/{id} { allow read: if isHouseholdMember(householdId); allow create: if canCreateHouseholdData(householdId); allow update, delete: if false; }
       match /transactions/{id} {
         allow read: if isHouseholdMember(householdId);
         allow create: if isHouseholdMember(householdId) && request.resource.data.description is string && validMoney(request.resource.data.amountCents) && request.resource.data.settlementPoolId is string && request.resource.data.status in ["draft", "posted", "excluded"] && (!request.resource.data.keys().hasAny(["settlementPeriodId"]) || periodEditable(householdId, request.resource.data.settlementPeriodId));
-        // A finalized period must be reopened before its transactions can change.
         allow update: if isHouseholdMember(householdId) && validMoney(request.resource.data.amountCents)
           && (!resource.data.keys().hasAny(["settlementPeriodId"]) || periodEditable(householdId, resource.data.settlementPeriodId))
           && (!request.resource.data.keys().hasAny(["settlementPeriodId"]) || periodEditable(householdId, request.resource.data.settlementPeriodId));
@@ -44,8 +135,6 @@ service cloud.firestore {
       match /settlementPeriods/{id} {
         allow read: if isHouseholdMember(householdId);
         allow create: if isHouseholdMember(householdId);
-        // An open/reviewed period may be finalized only with a snapshot ID;
-        // a finalized period can only transition back to open for reopening.
         allow update: if isHouseholdMember(householdId)
           && ((resource.data.status != "finalized" && request.resource.data.status != "finalized")
             || (resource.data.status != "finalized" && request.resource.data.status == "finalized" && request.resource.data.finalizedSettlementId is string)
@@ -53,10 +142,10 @@ service cloud.firestore {
         allow delete: if false;
       }
       match /settlements/{id} { allow read: if isHouseholdMember(householdId); allow create: if isHouseholdMember(householdId); allow update, delete: if false; }
-      match /recurringTemplates/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
-      match /imports/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
-      match /importRecords/{id} { allow read, create, update: if isHouseholdMember(householdId); allow delete: if false; }
-      match /auditLog/{id} { allow read, create: if isHouseholdMember(householdId); allow update, delete: if false; }
+      match /recurringTemplates/{id} { allow read, update: if isHouseholdMember(householdId); allow create: if isHouseholdMember(householdId); allow delete: if false; }
+      match /imports/{id} { allow read, update: if isHouseholdMember(householdId); allow create: if isHouseholdMember(householdId); allow delete: if false; }
+      match /importRecords/{id} { allow read, update: if isHouseholdMember(householdId); allow create: if isHouseholdMember(householdId); allow delete: if false; }
+      match /auditLog/{id} { allow read: if isHouseholdMember(householdId); allow create: if isHouseholdMember(householdId); allow update, delete: if false; }
     }
     match /{document=**} { allow read, write: if false; }
   }

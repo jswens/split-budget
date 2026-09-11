@@ -12,11 +12,13 @@ import type { BudgetRepository } from "./repositories/BudgetRepository";
 import { InMemoryBudgetRepository } from "./repositories/InMemoryBudgetRepository";
 import { db } from "./firebase/app";
 import { observeAuth, signInWithGoogle, signOutGoogle } from "./firebase/auth";
+import { getStoredHouseholdId, listPendingJoinRequests, rememberHouseholdId, type JoinRequest } from "./firebase/households";
 import { createSampleData } from "./ui/sampleData";
 import { download, inputMoney, money, monthLabel, parseMoney } from "./ui/format";
+import { HouseholdOnboarding, JoinRequestInbox } from "./ui/HouseholdOnboarding";
 
 type View = "ledger" | "projects" | "settings";
-type SetupState = "loading" | "ready" | "auth" | "setup" | "error";
+type SetupState = "loading" | "ready" | "auth" | "household" | "error";
 
 interface AppData {
   household: { id: string; name: string; timezone: string };
@@ -35,8 +37,9 @@ interface AppData {
   settlements: FinalizedSettlement[];
 }
 
-const configured = Boolean(import.meta.env.VITE_FIREBASE_PROJECT_ID && import.meta.env.VITE_HOUSEHOLD_ID);
-const householdId = import.meta.env.VITE_HOUSEHOLD_ID ?? "demo-household";
+const configured = Boolean(import.meta.env.VITE_FIREBASE_PROJECT_ID && import.meta.env.VITE_FIREBASE_API_KEY);
+const defaultHouseholdId = import.meta.env.VITE_HOUSEHOLD_ID ?? "";
+const previewHouseholdId = "demo-household";
 const actorFallback = import.meta.env.VITE_FIREBASE_ACTOR_UID ?? "demo-john";
 
 function currentMonth(): string {
@@ -50,14 +53,14 @@ function shiftMonth(month: string, offset: number): string {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
 }
 
-async function readData(repository: BudgetRepository, service: BudgetService, month: string, actorUid: string): Promise<AppData> {
-  await service.ensureSettlementPeriodForMonth(householdId, month, actorUid);
+async function readData(repository: BudgetRepository, service: BudgetService, targetHouseholdId: string, month: string, actorUid: string): Promise<AppData> {
+  await service.ensureSettlementPeriodForMonth(targetHouseholdId, month, actorUid);
   const [household, members, accounts, categories, projects, pools, periods, period, transactions, templates, exported] = await Promise.all([
-    repository.getHousehold(householdId), repository.getMembers(householdId), repository.getAccounts(householdId), repository.getCategories(householdId),
-    repository.getProjects(householdId), repository.getSettlementPools(householdId), repository.listSettlementPeriods(householdId),
-    repository.getSettlementPeriod(householdId, `period-${month}`), repository.listTransactionsForPeriod(householdId, `period-${month}`), repository.getRecurringTemplates(householdId), repository.exportAll(householdId),
+    repository.getHousehold(targetHouseholdId), repository.getMembers(targetHouseholdId), repository.getAccounts(targetHouseholdId), repository.getCategories(targetHouseholdId),
+    repository.getProjects(targetHouseholdId), repository.getSettlementPools(targetHouseholdId), repository.listSettlementPeriods(targetHouseholdId),
+    repository.getSettlementPeriod(targetHouseholdId, `period-${month}`), repository.listTransactionsForPeriod(targetHouseholdId, `period-${month}`), repository.getRecurringTemplates(targetHouseholdId), repository.exportAll(targetHouseholdId),
   ]);
-  const config = await repository.getConfigVersion(householdId, period.configVersionId);
+  const config = await repository.getConfigVersion(targetHouseholdId, period.configVersionId);
   const settlements = exported.settlements.filter((settlement) => settlement.settlementPeriodId === period.id);
   return { household, members, accounts, categories, projects, pools, config, period, periods, transactions, allTransactions: exported.transactions, templates, settlement: settlements.sort((a, b) => b.version - a.version)[0] ?? null, settlements };
 }
@@ -220,7 +223,7 @@ function ProjectsView({ data }: { data: AppData }) {
   return <section className="projects-view"><div className="section-heading"><div><p className="eyebrow">Mini-ledgers</p><h2>Projects</h2></div></div>{data.projects.length === 0 ? <div className="empty-state"><FolderKanban size={28} /><h3>No projects yet</h3><p>Create a project in Settings to track a one-time initiative.</p></div> : <div className="project-grid">{data.projects.map((project) => { const entries = data.allTransactions.filter((transaction) => transaction.projectId === project.id && transaction.status === "posted"); const total = entries.reduce((sum, transaction) => sum + (transaction.kind === "refund" || transaction.kind === "reimbursement" && transaction.reimbursement?.treatment === "reduce_expense" ? -transaction.amountCents : transaction.kind === "expense" ? transaction.amountCents : 0), 0); return <article className="project-card" key={project.id}><div className="project-card-top"><span className="project-mark"><FolderKanban size={18} /></span><span className={`status-pill ${project.status}`}>{project.status}</span></div><h3>{project.name}</h3><p>{entries.length} recorded {entries.length === 1 ? "entry" : "entries"} across all periods</p><div className="project-total">{money(total)}</div><div className="pool-breakdown">{Object.entries(entries.reduce<Record<string, number>>((summary, transaction) => { const value = transaction.kind === "refund" || transaction.kind === "reimbursement" && transaction.reimbursement?.treatment === "reduce_expense" ? -transaction.amountCents : transaction.kind === "expense" ? transaction.amountCents : 0; summary[transaction.settlementPoolId] = (summary[transaction.settlementPoolId] ?? 0) + value; return summary; }, {})).map(([pool, value]) => <span key={pool}>{poolName(data.pools, pool)} <b>{money(value)}</b></span>)}</div></article>; })}</div>}</section>;
 }
 
-function SettingsView({ data, repository, actorUid, onRefresh }: { data: AppData; repository: BudgetRepository; actorUid: string; onRefresh: () => Promise<void> }) {
+function SettingsView({ data, repository, householdId, actorUid, onRefresh }: { data: AppData; repository: BudgetRepository; householdId: string; actorUid: string; onRefresh: () => Promise<void> }) {
   const [kind, setKind] = useState<"account" | "category" | "pool" | "project" | "template" | "rules">("account");
   const [name, setName] = useState("");
   const [detail, setDetail] = useState("");
@@ -229,8 +232,18 @@ function SettingsView({ data, repository, actorUid, onRefresh }: { data: AppData
   const [ruleContributions, setRuleContributions] = useState<Record<string, string>>(() => Object.fromEntries(data.members.map((member) => [member.id, inputMoney(data.config.monthlyContributions[member.id] ?? 0)])));
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [copied, setCopied] = useState(false);
+  async function copyHouseholdCode() {
+    try {
+      await navigator.clipboard.writeText(householdId);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setError("Could not copy the household code. Select it manually instead.");
+    }
+  }
   async function save(event: FormEvent) { event.preventDefault(); setSaving(true); setError(""); try { const timestamp = new Date().toISOString(); if (kind === "rules") { const allocations = data.members.map((member) => ({ memberId: member.id, shareBasisPoints: parseBasisPoints(ruleShares[member.id] || "0") })).filter((allocation) => allocation.shareBasisPoints > 0); if (allocations.reduce((sum, allocation) => sum + allocation.shareBasisPoints, 0) !== 10000) throw new Error("Split shares must add up to 100%."); const monthlyContributions = Object.fromEntries(data.members.map((member) => [member.id, parseMoney(ruleContributions[member.id] || "0")])); const nextVersion = data.config.version + 1; await repository.saveConfig(householdId, { ...data.config, id: newId("config-v"), version: nextVersion, defaultAllocations: allocations, monthlyContributions, effectiveFrom: timestamp, createdAt: timestamp, createdByUid: actorUid, reason: "Updated in Settings" }, "Updated in Settings"); } else { if (!name.trim()) throw new Error("Name is required."); if (editingId) { if (kind === "account") await repository.saveAccount(householdId, { ...(data.accounts.find((item) => item.id === editingId) as Account), name: name.trim(), notes: detail || undefined, updatedAt: timestamp }); else if (kind === "category") await repository.saveCategory(householdId, { ...(data.categories.find((item) => item.id === editingId) as Category), name: name.trim() }); else if (kind === "pool") await repository.saveSettlementPool(householdId, { ...(data.pools.find((item) => item.id === editingId) as SettlementPool), name: name.trim(), description: detail || undefined }); else if (kind === "project") await repository.saveProject(householdId, { ...(data.projects.find((item) => item.id === editingId) as Project), name: name.trim() }); else await repository.saveRecurringTemplate(householdId, { ...(data.templates.find((item) => item.id === editingId) as RecurringTemplate), name: name.trim(), description: detail || name.trim(), updatedAt: timestamp }); } else if (kind === "account") await repository.saveAccount(householdId, { id: newId("account"), name: name.trim(), ownerType: "joint", type: "checking", active: true, notes: detail || undefined, createdAt: timestamp, updatedAt: timestamp }); else if (kind === "category") await repository.saveCategory(householdId, { id: newId("category"), name: name.trim(), type: "expense", active: true }); else if (kind === "pool") await repository.saveSettlementPool(householdId, { id: newId("pool"), name: name.trim(), active: true, description: detail || undefined }); else if (kind === "project") await repository.saveProject(householdId, { id: newId("project"), name: name.trim(), status: "active", createdAt: timestamp }); else await repository.saveRecurringTemplate(householdId, { id: newId("template"), name: name.trim(), description: detail || name.trim(), estimatedAmountCents: 0, settlementPoolId: data.config.defaultSettlementPoolId, allocations: data.config.defaultAllocations, importance: "normal", frequency: "monthly", active: true, createdAt: timestamp, updatedAt: timestamp }); setName(""); setDetail(""); setEditingId(undefined); } await onRefresh(); } catch (saveError) { setError(saveError instanceof Error ? saveError.message : "Could not save."); } finally { setSaving(false); } }
-  return <section className="settings-view"><div className="section-heading"><div><p className="eyebrow">Household setup</p><h2>Settings</h2></div><span className="settings-lock"><Settings2 size={15} /> Changes apply to future entries</span></div><div className="settings-grid"><form className="settings-form" onSubmit={save}><div className="settings-tabs">{(["account", "category", "pool", "project", "template", "rules"] as const).map((item) => <button type="button" key={item} className={kind === item ? "active" : ""} onClick={() => setKind(item)}>{item === "template" ? "Recurring" : item === "rules" ? "Split & rules" : item[0].toUpperCase() + item.slice(1)}{item === "rules" ? <Settings2 size={14} /> : <Plus size={14} />}</button>)}</div>{kind === "rules" ? <><h3>Split & contributions</h3><p className="muted">Versioned rules apply to new settlement periods. Existing periods keep their snapshot.</p><div className="rule-list">{data.members.map((member) => <div className="rule-row" key={member.id}><span>{member.displayName}</span><label><input value={ruleShares[member.id] ?? "0"} onChange={(event) => setRuleShares({ ...ruleShares, [member.id]: event.target.value })} inputMode="decimal" /><small>%</small></label><label><b>$</b><input value={ruleContributions[member.id] ?? "0.00"} onChange={(event) => setRuleContributions({ ...ruleContributions, [member.id]: event.target.value })} inputMode="decimal" /></label></div>)}</div></> : <><h3>Add {kind === "template" ? "recurring item" : kind}</h3><p className="muted">Keep the ledger vocabulary clear for everyone sharing it.</p><label className="field"><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder={kind === "pool" ? "e.g. Renovation" : "Name for this item"} required /></label><label className="field"><span>{kind === "template" ? "Description" : "Notes"}</span><textarea value={detail} onChange={(event) => setDetail(event.target.value)} rows={2} placeholder="Optional details" /></label></>}{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<button className="button primary" disabled={saving}>{saving ? "Saving…" : <><Save size={16} />Save {kind === "rules" ? "rules" : kind}</>}</button></form><div className="settings-lists"><SettingsList title="Accounts" items={data.accounts.map((account) => `${account.name} · ${account.type}`)} action={data.accounts.filter((account) => account.active).length ? <span className="list-count">{data.accounts.filter((account) => account.active).length} active</span> : undefined} /><SettingsList title="Categories" items={data.categories.map((category) => category.name)} /><SettingsList title="Settlement pools" items={data.pools.map((pool) => pool.name)} /><SettingsList title="Recurring templates" items={data.templates.map((template) => template.name)} /></div></div><div className="settings-footnote"><WalletCards size={17} /><span>Use statement mode for a card bill. In transaction mode, record purchases and the card payment as a transfer.</span></div></section>;
+  return <section className="settings-view"><div className="section-heading"><div><p className="eyebrow">Household setup</p><h2>Settings</h2></div><span className="settings-lock"><Settings2 size={15} /> Changes apply to future entries</span></div><div className="household-code-card"><div><p className="eyebrow">Invite a member</p><h3>Share this household code</h3><p>Give it to someone you trust. They can request access from the sign-in screen.</p></div><code>{householdId}</code><button className="button outline compact" onClick={() => void copyHouseholdCode()}>{copied ? "Copied" : "Copy code"}</button></div><div className="settings-grid"><form className="settings-form" onSubmit={save}><div className="settings-tabs">{(["account", "category", "pool", "project", "template", "rules"] as const).map((item) => <button type="button" key={item} className={kind === item ? "active" : ""} onClick={() => setKind(item)}>{item === "template" ? "Recurring" : item === "rules" ? "Split & rules" : item[0].toUpperCase() + item.slice(1)}{item === "rules" ? <Settings2 size={14} /> : <Plus size={14} />}</button>)}</div>{kind === "rules" ? <><h3>Split & contributions</h3><p className="muted">Versioned rules apply to new settlement periods. Existing periods keep their snapshot.</p><div className="rule-list">{data.members.map((member) => <div className="rule-row" key={member.id}><span>{member.displayName}</span><label><input value={ruleShares[member.id] ?? "0"} onChange={(event) => setRuleShares({ ...ruleShares, [member.id]: event.target.value })} inputMode="decimal" /><small>%</small></label><label><b>$</b><input value={ruleContributions[member.id] ?? "0.00"} onChange={(event) => setRuleContributions({ ...ruleContributions, [member.id]: event.target.value })} inputMode="decimal" /></label></div>)}</div></> : <><h3>Add {kind === "template" ? "recurring item" : kind}</h3><p className="muted">Keep the ledger vocabulary clear for everyone sharing it.</p><label className="field"><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder={kind === "pool" ? "e.g. Renovation" : "Name for this item"} required /></label><label className="field"><span>{kind === "template" ? "Description" : "Notes"}</span><textarea value={detail} onChange={(event) => setDetail(event.target.value)} rows={2} placeholder="Optional details" /></label></>}{error && <div className="form-error"><CircleAlert size={16} />{error}</div>}<button className="button primary" disabled={saving}>{saving ? "Saving…" : <><Save size={16} />Save {kind === "rules" ? "rules" : kind}</>}</button></form><div className="settings-lists"><SettingsList title="Accounts" items={data.accounts.map((account) => `${account.name} · ${account.type}`)} action={data.accounts.filter((account) => account.active).length ? <span className="list-count">{data.accounts.filter((account) => account.active).length} active</span> : undefined} /><SettingsList title="Categories" items={data.categories.map((category) => category.name)} /><SettingsList title="Settlement pools" items={data.pools.map((pool) => pool.name)} /><SettingsList title="Recurring templates" items={data.templates.map((template) => template.name)} /></div></div><div className="settings-footnote"><WalletCards size={17} /><span>Use statement mode for a card bill. In transaction mode, record purchases and the card payment as a transfer.</span></div></section>;
 }
 
 function SettingsList({ title, items, action }: { title: string; items: string[]; action?: ReactNode }) { return <div className="settings-list"><div className="settings-list-head"><strong>{title}</strong>{action}</div>{items.length ? items.map((item) => <div className="settings-item" key={item}><span>{item}</span><span className="list-dot"></span></div>) : <p className="muted">Nothing added yet.</p>}</div>; }
@@ -247,39 +260,80 @@ function App() {
   const [editing, setEditing] = useState<Transaction | undefined>();
   const [selectedId, setSelectedId] = useState<string>();
   const [toast, setToast] = useState("");
+  const [activeHouseholdId, setActiveHouseholdId] = useState(() => getStoredHouseholdId() || defaultHouseholdId);
+  const [pendingRequests, setPendingRequests] = useState<JoinRequest[]>([]);
 
   const actorUid = user?.uid ?? actorFallback;
   const service = useMemo(() => repository ? new BudgetService(repository) : null, [repository]);
 
-  const load = useCallback(async (targetRepository: BudgetRepository, targetMonth: string, targetActor: string) => {
+  const load = useCallback(async (targetRepository: BudgetRepository, targetHouseholdId: string, targetMonth: string, targetActor: string) => {
     const targetService = new BudgetService(targetRepository);
-    const next = await readData(targetRepository, targetService, targetMonth, targetActor);
+    const next = await readData(targetRepository, targetService, targetHouseholdId, targetMonth, targetActor);
     setData(next); setSetup("ready"); setError("");
   }, []);
 
   const resetPreview = useCallback(async (targetMonth = month) => {
     const nextRepository = new InMemoryBudgetRepository();
-    await nextRepository.restoreAll(householdId, createSampleData(targetMonth), actorFallback);
-    setRepository(nextRepository); await load(nextRepository, targetMonth, actorFallback);
+    await nextRepository.restoreAll(previewHouseholdId, createSampleData(targetMonth), actorFallback);
+    setRepository(nextRepository); await load(nextRepository, previewHouseholdId, targetMonth, actorFallback);
   }, [load, month]);
 
-  useEffect(() => { if (!configured) { void resetPreview(); return; } const stop = observeAuth((nextUser) => { setUser(nextUser); if (!nextUser) { setSetup("auth"); setData(null); return; } const nextRepository = new FirestoreBudgetRepository(db); setRepository(nextRepository); void load(nextRepository, month, nextUser.uid).catch((loadError) => { setSetup("error"); setError(loadError instanceof Error ? loadError.message : "Could not load the household."); }); }); return stop; }, [load, month, resetPreview]);
+  const openHousehold = useCallback((nextHouseholdId: string) => {
+    rememberHouseholdId(nextHouseholdId);
+    setActiveHouseholdId(nextHouseholdId);
+    setData(null);
+    setSetup("loading");
+    setError("");
+  }, []);
 
-  async function changeMonth(nextMonth: string) { if (!repository) return; setSetup("loading"); try { await load(repository, nextMonth, actorUid); setMonth(nextMonth); } catch (loadError) { setSetup("error"); setError(loadError instanceof Error ? loadError.message : "Could not load this month."); } }
-  async function refresh() { if (repository) await load(repository, month, actorUid); }
-  async function saveTransaction(transaction: Transaction) { if (!repository) return; await repository.saveTransaction(householdId, transaction); await refresh(); setToast(transaction.status === "draft" ? "Draft saved" : "Entry saved"); }
-  async function excludeTransaction(transaction: Transaction) { if (!repository) return; if (!window.confirm(`Exclude “${transaction.description}” from settlement? It will remain in history.`)) return; await repository.archiveTransaction(householdId, transaction.id, actorUid, "Excluded from settlement"); await refresh(); setToast("Entry excluded"); }
-  async function togglePool(poolId: string) { if (!repository || !data) return; const included = data.period.includedSettlementPoolIds.includes(poolId); const nextPeriod = { ...data.period, includedSettlementPoolIds: included ? data.period.includedSettlementPoolIds.filter((id) => id !== poolId) : [...data.period.includedSettlementPoolIds, poolId], updatedAt: new Date().toISOString(), updatedByUid: actorUid }; await repository.saveSettlementPeriod(householdId, nextPeriod, data.period.updatedAt); await refresh(); }
-  async function finalize() { if (!service || !data) return; try { await service.finalizePeriod(householdId, data.period.id, actorUid); await refresh(); setToast("Settlement finalized"); } catch (finalizeError) { setToast(finalizeError instanceof Error ? finalizeError.message : "Could not finalize"); } }
-  async function reopen() { if (!service || !data || !window.confirm("Reopen this period? The existing settlement snapshot stays in history.")) return; try { await service.reopenPeriod(householdId, data.period.id, actorUid, true); await refresh(); setToast("Period reopened"); } catch (reopenError) { setToast(reopenError instanceof Error ? reopenError.message : "Could not reopen"); } }
-  async function exportJson() { if (!repository) return; const value = await repository.exportAll(householdId); download(`household-budget-${month}.json`, JSON.stringify(value, null, 2), "application/json"); setToast("JSON backup downloaded"); }
-  async function exportTransactions() { if (!repository) return; const value = await repository.exportAll(householdId); download(`household-transactions-${month}.csv`, exportTransactionsCsv(value.transactions), "text/csv;charset=utf-8"); setToast("Transactions CSV downloaded"); }
-  async function exportSettlements() { if (!repository) return; const value = await repository.exportAll(householdId); download(`household-settlements-${month}.csv`, exportSettlementsCsv(value.settlements), "text/csv;charset=utf-8"); setToast("Settlements CSV downloaded"); }
+  useEffect(() => {
+    if (!configured) {
+      void resetPreview();
+      return;
+    }
+    const stop = observeAuth((nextUser) => {
+      setUser(nextUser);
+      setData(null);
+      setPendingRequests([]);
+      if (!nextUser) {
+        setSetup("auth");
+        return;
+      }
+      if (!activeHouseholdId) {
+        setSetup("household");
+        return;
+      }
+      const nextRepository = new FirestoreBudgetRepository(db);
+      setRepository(nextRepository);
+      void load(nextRepository, activeHouseholdId, month, nextUser.uid).catch((loadError) => {
+        setSetup("household");
+        setError(loadError instanceof Error ? loadError.message : "Choose or create a household to continue.");
+      });
+    });
+    return stop;
+  }, [activeHouseholdId, load, month, resetPreview]);
+
+  useEffect(() => {
+    if (!configured || setup !== "ready" || !activeHouseholdId) return;
+    void listPendingJoinRequests(activeHouseholdId).then(setPendingRequests).catch(() => setPendingRequests([]));
+  }, [activeHouseholdId, setup]);
+
+  async function changeMonth(nextMonth: string) { if (!repository || !activeHouseholdId) return; setSetup("loading"); try { await load(repository, activeHouseholdId, nextMonth, actorUid); setMonth(nextMonth); } catch (loadError) { setSetup("error"); setError(loadError instanceof Error ? loadError.message : "Could not load this month."); } }
+  async function refresh() { if (repository && activeHouseholdId) await load(repository, activeHouseholdId, month, actorUid); }
+  async function saveTransaction(transaction: Transaction) { if (!repository || !activeHouseholdId) return; await repository.saveTransaction(activeHouseholdId, transaction); await refresh(); setToast(transaction.status === "draft" ? "Draft saved" : "Entry saved"); }
+  async function excludeTransaction(transaction: Transaction) { if (!repository || !activeHouseholdId) return; if (!window.confirm(`Exclude “${transaction.description}” from settlement? It will remain in history.`)) return; await repository.archiveTransaction(activeHouseholdId, transaction.id, actorUid, "Excluded from settlement"); await refresh(); setToast("Entry excluded"); }
+  async function togglePool(poolId: string) { if (!repository || !data || !activeHouseholdId) return; const included = data.period.includedSettlementPoolIds.includes(poolId); const nextPeriod = { ...data.period, includedSettlementPoolIds: included ? data.period.includedSettlementPoolIds.filter((id) => id !== poolId) : [...data.period.includedSettlementPoolIds, poolId], updatedAt: new Date().toISOString(), updatedByUid: actorUid }; await repository.saveSettlementPeriod(activeHouseholdId, nextPeriod, data.period.updatedAt); await refresh(); }
+  async function finalize() { if (!service || !data || !activeHouseholdId) return; try { await service.finalizePeriod(activeHouseholdId, data.period.id, actorUid); await refresh(); setToast("Settlement finalized"); } catch (finalizeError) { setToast(finalizeError instanceof Error ? finalizeError.message : "Could not finalize"); } }
+  async function reopen() { if (!service || !data || !activeHouseholdId || !window.confirm("Reopen this period? The existing settlement snapshot stays in history.")) return; try { await service.reopenPeriod(activeHouseholdId, data.period.id, actorUid, true); await refresh(); setToast("Period reopened"); } catch (reopenError) { setToast(reopenError instanceof Error ? reopenError.message : "Could not reopen"); } }
+  async function exportJson() { if (!repository || !activeHouseholdId) return; const value = await repository.exportAll(activeHouseholdId); download(`household-budget-${month}.json`, JSON.stringify(value, null, 2), "application/json"); setToast("JSON backup downloaded"); }
+  async function exportTransactions() { if (!repository || !activeHouseholdId) return; const value = await repository.exportAll(activeHouseholdId); download(`household-transactions-${month}.csv`, exportTransactionsCsv(value.transactions), "text/csv;charset=utf-8"); setToast("Transactions CSV downloaded"); }
+  async function exportSettlements() { if (!repository || !activeHouseholdId) return; const value = await repository.exportAll(activeHouseholdId); download(`household-settlements-${month}.csv`, exportSettlementsCsv(value.settlements), "text/csv;charset=utf-8"); setToast("Settlements CSV downloaded"); }
   async function restoreFile(event: ChangeEvent<HTMLInputElement>) { const file = event.target.files?.[0]; if (!file) return; try { const raw = parseBudgetExport(await file.text()); assertValidBudgetExport(raw); setModal("restore"); (window as typeof window & { __pendingBudgetRestore?: BudgetExportV1 }).__pendingBudgetRestore = raw; } catch (restoreError) { setToast(restoreError instanceof Error ? restoreError.message : "Backup is not valid"); } event.target.value = ""; }
-  async function confirmRestore() { const pending = (window as typeof window & { __pendingBudgetRestore?: BudgetExportV1 }).__pendingBudgetRestore; if (!pending) return; if (configured) { setToast("Restore requires an empty household target; use the repository restore workflow."); setModal(null); return; } const nextRepository = new InMemoryBudgetRepository(); try { await nextRepository.restoreAll(householdId, pending, actorFallback); setRepository(nextRepository); const restoredMonth = pending.settlementPeriods[0]?.name.match(/^\d{4}-\d{2}$/)?.[0] ?? month; setMonth(restoredMonth); await load(nextRepository, restoredMonth, actorFallback); setModal(null); setToast("Backup restored into preview"); } catch (restoreError) { setToast(restoreError instanceof Error ? restoreError.message : "Could not restore backup"); } }
+  async function confirmRestore() { const pending = (window as typeof window & { __pendingBudgetRestore?: BudgetExportV1 }).__pendingBudgetRestore; if (!pending) return; if (configured) { setToast("Restore requires an empty household target; use the repository restore workflow."); setModal(null); return; } const nextRepository = new InMemoryBudgetRepository(); try { await nextRepository.restoreAll(previewHouseholdId, pending, actorFallback); setRepository(nextRepository); const restoredMonth = pending.settlementPeriods[0]?.name.match(/^\d{4}-\d{2}$/)?.[0] ?? month; setMonth(restoredMonth); await load(nextRepository, previewHouseholdId, restoredMonth, actorFallback); setModal(null); setToast("Backup restored into preview"); } catch (restoreError) { setToast(restoreError instanceof Error ? restoreError.message : "Could not restore backup"); } }
 
   if (setup === "loading") return <div className="loading-screen"><div className="brand-mark"><Sparkles size={18} /></div><p>Opening your household worksheet…</p></div>;
   if (configured && setup === "auth") return <div className="setup-screen"><div className="setup-card"><div className="brand-mark large"><Sparkles size={22} /></div><p className="eyebrow">Private household workspace</p><h1>Make the month easy to close.</h1><p>Sign in with an approved Google account to open your shared ledger.</p><button className="button primary full" onClick={() => void signInWithGoogle()}>Continue with Google</button><small>Only household members can access this workspace.</small></div></div>;
+  if (configured && setup === "household" && user) return <HouseholdOnboarding user={user} initialHouseholdId={defaultHouseholdId} error={error} onHouseholdReady={openHousehold} />;
   if (setup === "error" || !data || !repository) return <div className="setup-screen"><div className="setup-card"><div className="brand-mark large"><CircleAlert size={22} /></div><p className="eyebrow">Couldn’t open the worksheet</p><h1>There’s a setup step left.</h1><p>{error || "Configure a household or use the synthetic preview to explore the app."}</p>{!configured && <button className="button primary full" onClick={() => void resetPreview()}>Reload sample preview</button>}{configured && <button className="button ghost full" onClick={() => void signOutGoogle()}>Sign out</button>}</div></div>;
 
   const report = calculateMonthlySpendingReport(data.allTransactions, month);
@@ -287,10 +341,11 @@ function App() {
   return <div className="app-shell">
     <aside className="sidebar"><div className="brand"><span className="brand-mark"><Sparkles size={17} /></span><span><strong>split</strong><small>household ledger</small></span></div><nav className="primary-nav"><button className={view === "ledger" ? "active" : ""} onClick={() => setView("ledger")}><BookOpen size={17} />Ledger</button><button className={view === "projects" ? "active" : ""} onClick={() => setView("projects")}><FolderKanban size={17} />Projects</button><button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}><Settings2 size={17} />Settings</button></nav><div className="sidebar-bottom"><div className="online-state"><span></span><span>Online workspace</span></div>{configured && <button className="signout" onClick={() => void signOutGoogle()}>Sign out</button>}<div className="user-card"><span className="avatar">{initials(data.members[0]?.displayName ?? "Household")}</span><span><strong>{user?.displayName ?? data.members[0]?.displayName ?? "Household"}</strong><small>{configured ? "Shared access" : "Preview access"}</small></span></div></div></aside>
     <main className="main-content"><header className="topbar"><div className="mobile-brand"><span className="brand-mark"><Sparkles size={16} /></span><strong>split</strong></div><div className="breadcrumb"><span>Household</span><b>/</b><strong>{view === "ledger" ? monthLabel(month) : view === "projects" ? "Projects" : "Settings"}</strong></div><div className="top-actions"><label className="import-button"><FileUp size={16} /><span>Restore</span><input type="file" accept="application/json" onChange={restoreFile} /></label><button className="icon-btn" onClick={() => void exportJson()} aria-label="Download backup"><Download size={17} /></button>{configured && <button className="mobile-signout" onClick={() => void signOutGoogle()}>Sign out</button>}<span className="avatar top-avatar">{initials(data.members[0]?.displayName ?? "H")}</span></div></header><nav className="mobile-nav" aria-label="Primary navigation"><button className={view === "ledger" ? "active" : ""} onClick={() => setView("ledger")}><BookOpen size={14} /> Ledger</button><button className={view === "projects" ? "active" : ""} onClick={() => setView("projects")}><FolderKanban size={14} /> Projects</button><button className={view === "settings" ? "active" : ""} onClick={() => setView("settings")}><Settings2 size={14} /> Settings</button></nav>
+      {configured && pendingRequests.length > 0 && <JoinRequestInbox householdId={activeHouseholdId} reviewerUid={actorUid} requests={pendingRequests} onChanged={async () => { setPendingRequests(await listPendingJoinRequests(activeHouseholdId)); }} />}
       {!configured && <div className="preview-banner"><Sparkles size={15} /> Sample preview · synthetic entries only · edits reset on reload</div>}
       {view === "ledger" && <><section className="month-header"><div className="month-title"><p className="eyebrow">Settlement period</p><h1>{monthLabel(month)}</h1><span className={`status-pill ${data.period.status}`}>{data.period.status === "finalized" ? <><Check size={13} />Finalized</> : <><CalendarDays size={13} />Open for edits</>}</span></div><div className="month-controls"><button className="icon-btn" onClick={() => void changeMonth(shiftMonth(month, -1))} aria-label="Previous month"><ArrowLeft size={17} /></button><button className="today-button" onClick={() => void changeMonth(currentMonth())}>This month</button><button className="icon-btn" onClick={() => void changeMonth(shiftMonth(month, 1))} aria-label="Next month"><ArrowRight size={17} /></button></div></section><section className="spending-strip"><div className="spending-total"><span>Recorded spending</span><strong>{money(postedTotal)}</strong><small>{report.transactionIds.length} posted entries · all pools</small></div><div className="pool-summary">{Object.entries(report.bySettlementPool).map(([pool, value]) => <span key={pool}><i className="pool-swatch"></i>{poolName(data.pools, pool)} <b>{money(value)}</b></span>)}</div><button className="report-button" onClick={() => setView("projects")}><BarChart3 size={16} />View report</button></section><div className="content-grid"><Ledger data={data} onAdd={() => { setEditing(undefined); setModal("transaction"); }} onEdit={(transaction) => { setEditing(transaction); setModal("transaction"); }} onExclude={(transaction) => void excludeTransaction(transaction)} selectedId={selectedId} onSelected={setSelectedId} /><SettlementPanel data={data} onPoolToggle={(poolId) => void togglePool(poolId)} onFinalize={() => void finalize()} onReopen={() => void reopen()} onSelectTransaction={(id) => { setSelectedId(id); window.scrollTo({ top: 500, behavior: "smooth" }); }} /></div></>}
       {view === "projects" && <><section className="month-header compact"><div className="month-title"><p className="eyebrow">Across the ledger</p><h1>Projects</h1></div><button className="button primary" onClick={() => setView("settings")}><Plus size={16} />New project</button></section><ProjectsView data={data} /></>}
-      {view === "settings" && <><section className="month-header compact"><div className="month-title"><p className="eyebrow">Household controls</p><h1>Settings</h1></div></section><SettingsView data={data} repository={repository} actorUid={actorUid} onRefresh={refresh} /></>}
+      {view === "settings" && <><section className="month-header compact"><div className="month-title"><p className="eyebrow">Household controls</p><h1>Settings</h1></div></section><SettingsView data={data} repository={repository} householdId={activeHouseholdId} actorUid={actorUid} onRefresh={refresh} /></>}
       <footer className="app-footer"><span><Sparkles size={13} /> {configured ? "Private household data" : "Synthetic preview data"}</span><span>Export: <button onClick={() => void exportJson()}>JSON</button> · <button onClick={() => void exportTransactions()}>transactions CSV</button> · <button onClick={() => void exportSettlements()}>settlements CSV</button></span></footer>
     </main>
     {modal === "transaction" && <TransactionForm transaction={editing} data={data} actorUid={actorUid} onSave={saveTransaction} onClose={() => setModal(null)} />}

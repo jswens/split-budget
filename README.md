@@ -15,7 +15,7 @@ npm run dev
 
 Open the local URL printed by Vite. Without Firebase configuration, the app offers an explicitly labeled synthetic preview. Preview edits are held in memory and reset when the page reloads. Real household records are never bundled into the client.
 
-For Firebase, copy `.env.example` to `.env.local`, supply the web app configuration and household ID, and follow [Firebase setup](docs/FIREBASE_SETUP.md). The two approved members must be provisioned through a trusted administrative path; Google sign-in alone grants no data access.
+For Firebase, copy `.env.example` to `.env.local`, supply the web app configuration, and follow [Firebase setup](docs/FIREBASE_SETUP.md). `VITE_HOUSEHOLD_ID` is optional for new households; after Google sign-in, the app offers create-or-join onboarding. Existing members can copy their household code from Settings, and requests require approval before access is granted.
 
 ## Verify
 
@@ -44,6 +44,6 @@ Historical spreadsheet migration is separate from deferred bank/CSV imports. Pre
 
 The production branch is `master`. The `Checks` workflow validates pull requests, and the production workflow builds the Vite app before deploying Hosting, Firestore rules, and Firestore indexes.
 
-Create a GitHub `production` environment. Set variables `FIREBASE_PROJECT_ID`, `VITE_FIREBASE_AUTH_DOMAIN`, `VITE_FIREBASE_APP_ID`, and `VITE_HOUSEHOLD_ID`; the storage, messaging sender, and measurement ID variables are optional because the client has project defaults. Set secrets `VITE_FIREBASE_API_KEY` and `FIREBASE_SERVICE_ACCOUNT_SPLIT_BUDGET_69C92` (a Firebase deployment service account JSON credential). Grant only the roles needed for Hosting and Firestore rules/index deployment. Enable Google auth, provision the household/config/members, then push to `master`. Use a single production Firebase project; local tests use emulators.
+Create a GitHub `production` environment. Set variables `FIREBASE_PROJECT_ID`, `VITE_FIREBASE_AUTH_DOMAIN`, and `VITE_FIREBASE_APP_ID`; `VITE_HOUSEHOLD_ID` remains useful as a default for an existing household but is optional for first-time onboarding. The storage, messaging sender, and measurement ID variables are optional because the client has project defaults. Set secrets `VITE_FIREBASE_API_KEY` and `FIREBASE_SERVICE_ACCOUNT_SPLIT_BUDGET_69C92` (a Firebase deployment service account JSON credential). Grant only the roles needed for Hosting and Firestore rules/index deployment. Enable Google auth, then push to `master`. Use a single production Firebase project; local tests use emulators.
 
 There is no server runtime, bank integration, offline mutation queue, joint-account balance tracker or settlement-payment tracker. The PWA requires connectivity for real data entry. Before production launch, complete the unchecked external acceptance gates in the master checklist.
